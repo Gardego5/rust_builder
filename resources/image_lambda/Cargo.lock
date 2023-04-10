@@ -194,17 +194,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hello_world_lambda"
-version = "0.1.0"
-dependencies = [
- "lambda_http",
- "lambda_runtime",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "hermit-abi"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -288,6 +277,17 @@ checksum = "e14ddfc70884202db2244c223200c204c2bda1bc6e0998d11b5e024d657209e6"
 dependencies = [
  "unicode-bidi",
  "unicode-normalization",
+]
+
+[[package]]
+name = "image_lambda"
+version = "0.1.0"
+dependencies = [
+ "lambda_http",
+ "lambda_runtime",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

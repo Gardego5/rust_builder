@@ -1,0 +1,22 @@
+#!/bin/sh
+
+# Change to directory of this script
+cd "$(dirname "$0")"
+
+# Array of lambdas to build
+lamdbas=$(ls resources)
+
+# Loop over array
+for lambda in ${lamdbas[@]}
+do
+  $(
+    # Change to directory of lamdba
+    cd resources/$lambda;
+
+    # Build this lambda, and output in the bin directory.
+    cargo lambda build \
+      --release \
+      --arm64 \
+      --lambda-dir ../../bin;
+  )
+done

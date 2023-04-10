@@ -1,0 +1,3 @@
+{
+  "rust-analyzer.linkedProjects": ["resources/image_lambda/Cargo.toml"]
+}
