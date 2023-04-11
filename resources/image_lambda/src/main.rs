@@ -95,7 +95,7 @@ async fn root<'a>(
         environment,
     }): State<WarmContext>,
 ) -> Response<'a, impl IntoResponse> {
-    println!("PATH: {}", &path);
+    println!("Hello Lambda World");
 
     let objects = s3_client
         .list_objects_v2()
@@ -141,7 +141,7 @@ async fn root<'a>(
 #[tokio::main]
 async fn main() -> Result<(), lambda_http::Error> {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
+        .with_max_level(tracing::Level::INFO)
         .with_ansi(false)
         .with_target(false)
         .without_time()

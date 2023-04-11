@@ -50,7 +50,7 @@ data "aws_iam_policy_document" "image_lambda" {
   statement {
     effect    = "Allow"
     actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-    resources = [aws_cloudwatch_log_group.image_lambda.arn]
+    resources = ["arn:aws:logs:*:*:*"]
   }
 }
 
@@ -59,7 +59,7 @@ resource "aws_iam_role_policy" "image_lambda" {
   policy = data.aws_iam_policy_document.image_lambda.json
 }
 
-resource "aws_iam_role_policy_attachment" "name" {
+resource "aws_iam_role_policy_attachment" "image_lambda_read_image_bucket" {
   role       = aws_iam_role.image_lambda.name
   policy_arn = aws_iam_policy.image_bucket_read.arn
 }
