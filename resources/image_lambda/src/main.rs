@@ -1,10 +1,103 @@
 use axum::{
-    extract::{Path, State},
-    http::{header, StatusCode},
+    extract::{Path, Query, State},
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
     Json, Router,
 };
+
+async fn root<'a>(
+    headers: HeaderMap,
+    query: Query<Params>,
+    Path((path,)): Path<(String,)>,
+    State(WarmContext {
+        s3_client,
+        environment,
+    }): State<WarmContext>,
+) -> Response<'a, impl IntoResponse> {
+    let content_type = match headers.get("accept") {
+        Some(t) => t.to_str().or_else(Error::op(
+            StatusCode::BAD_REQUEST,
+            "Couldn't read accept header.",
+        ))?,
+        None => "image/png",
+    };
+
+    let format = match content_type.split_once("/").ok_or_else(Error::err(
+        StatusCode::BAD_REQUEST,
+        "invalid `accept` header.",
+    ))? {
+        ("image", "png") => Ok(image::ImageFormat::Png),
+        ("image", "webp") => Ok(image::ImageFormat::WebP),
+        ("image", "jpg" | "jpeg") => Ok(image::ImageFormat::Jpeg),
+        _ => Err(Error::err(
+            StatusCode::BAD_REQUEST,
+            format!("invalid `accept` header"),
+        )()),
+    }?;
+
+    let (width, height) = match query.0 {
+        Params {
+            width: Some(w),
+            height: Some(h),
+        } => (w, h),
+        _ => (100, 100),
+    };
+
+    let object = s3_client
+        .get_object()
+        .bucket(&environment.bucket_name)
+        .key(&path)
+        .send()
+        .await
+        .or_else(Error::op(
+            StatusCode::NOT_FOUND,
+            format!("Couldn't find image at {:?}", &path),
+        ))?;
+
+    let in_buffer = object
+        .body
+        .collect()
+        .await
+        .or_else(Error::op(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Couldn't collect object body.",
+        ))?
+        .into_bytes();
+
+    let image = image::load_from_memory(&in_buffer)
+        .or_else(Error::op(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Couldn't load image from memory.",
+        ))?
+        .resize_exact(width, height, image::imageops::Gaussian);
+
+    let mut out_buffer = std::io::BufWriter::new(std::io::Cursor::new(Vec::new()));
+    image.write_to(&mut out_buffer, format).or_else(Error::op(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Couldn't encode image. [0]",
+    ))?;
+
+    let bytes = out_buffer
+        .into_inner()
+        .or_else(Error::op(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Couldn't encode image. [1]",
+        ))?
+        .into_inner();
+
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, content_type.to_string())],
+        bytes,
+    ))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct Params {
+    width: Option<u32>,
+    height: Option<u32>,
+}
 
 #[derive(serde::Serialize)]
 struct Error {
@@ -85,60 +178,6 @@ impl Environment {
 struct WarmContext {
     s3_client: aws_sdk_s3::Client,
     environment: Environment,
-}
-
-async fn root<'a>(
-    Path((path,)): Path<(String,)>,
-    State(WarmContext {
-        s3_client,
-        environment,
-    }): State<WarmContext>,
-) -> Response<'a, impl IntoResponse> {
-    let ob = s3_client
-        .get_object()
-        .bucket(&environment.bucket_name)
-        .key(&path)
-        .send()
-        .await
-        .or_else(Error::op(
-            StatusCode::NOT_FOUND,
-            format!("Couldn't find image at {:?}", &path),
-        ))?;
-
-    let buffer = ob
-        .body
-        .collect()
-        .await
-        .or_else(Error::op(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Couldn't collect object body.",
-        ))?
-        .into_bytes();
-
-    let resized_image = image::load_from_memory(&buffer)
-        .or_else(Error::op(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Couldn't load image from memory.",
-        ))?
-        .resize_exact(100, 100, image::imageops::Gaussian);
-
-    let mut buffer = std::io::BufWriter::new(std::io::Cursor::new(Vec::new()));
-    resized_image
-        .write_to(&mut buffer, image::ImageFormat::Png)
-        .or_else(Error::op(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Couldn't encode image. [0]",
-        ))?;
-
-    let bytes = buffer
-        .into_inner()
-        .or_else(Error::op(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Couldn't encode image. [1]",
-        ))?
-        .into_inner();
-
-    Ok((StatusCode::OK, [(header::CONTENT_TYPE, "image/png")], bytes))
 }
 
 #[tokio::main]
