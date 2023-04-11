@@ -5,7 +5,6 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use lambda_http::aws_lambda_events::serde_json::json;
 
 #[derive(serde::Serialize)]
 struct Error {
@@ -95,18 +94,6 @@ async fn root<'a>(
         environment,
     }): State<WarmContext>,
 ) -> Response<'a, impl IntoResponse> {
-    println!("Hello Lambda World");
-
-    let objects = s3_client
-        .list_objects_v2()
-        .bucket(&environment.bucket_name)
-        .send()
-        .await
-        .or_else(Error::op(StatusCode::INTERNAL_SERVER_ERROR, ""))?
-        .contents()
-        .ok_or_else(Error::err(StatusCode::BAD_REQUEST, "Contents were None."))?
-        .to_owned();
-
     let ob = s3_client
         .get_object()
         .bucket(&environment.bucket_name)
@@ -118,24 +105,40 @@ async fn root<'a>(
             format!("Couldn't find image at {:?}", &path),
         ))?;
 
-    let meta = ob
-        .metadata()
-        .ok_or_else(Error::err(
+    let buffer = ob
+        .body
+        .collect()
+        .await
+        .or_else(Error::op(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "No metadata found.",
+            "Couldn't collect object body.",
         ))?
-        .clone();
+        .into_bytes();
 
-    println!("{meta:?}");
+    let resized_image = image::load_from_memory(&buffer)
+        .or_else(Error::op(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Couldn't load image from memory.",
+        ))?
+        .resize_exact(100, 100, image::imageops::Gaussian);
 
-    Ok((
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        Json::from(json!({
-            "objects": objects.iter().map(|o| format!("{o:?}")).collect::<Vec<String>>(),
-            "meta": meta
-        })),
-    ))
+    let mut buffer = std::io::BufWriter::new(std::io::Cursor::new(Vec::new()));
+    resized_image
+        .write_to(&mut buffer, image::ImageFormat::Png)
+        .or_else(Error::op(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Couldn't encode image. [0]",
+        ))?;
+
+    let bytes = buffer
+        .into_inner()
+        .or_else(Error::op(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Couldn't encode image. [1]",
+        ))?
+        .into_inner();
+
+    Ok((StatusCode::OK, [(header::CONTENT_TYPE, "image/png")], bytes))
 }
 
 #[tokio::main]
