@@ -20,12 +20,17 @@ resource "aws_lambda_function" "image_lambda" {
   }
 }
 
+resource "aws_cloudwatch_log_group" "image_lambda" {
+  name              = "/aws/lambda/${aws_lambda_function.image_lambda.function_name}"
+  retention_in_days = 1
+}
+
 resource "aws_lambda_function_url" "image_lambda" {
   function_name      = aws_lambda_function.image_lambda.function_name
   authorization_type = "NONE"
 }
 
-data "aws_iam_policy_document" "image_lambda" {
+data "aws_iam_policy_document" "image_lambda_assume_role" {
   statement {
     effect  = "Allow"
     actions = ["sts:AssumeRole"]
@@ -36,8 +41,25 @@ data "aws_iam_policy_document" "image_lambda" {
   }
 }
 
-
 resource "aws_iam_role" "image_lambda" {
   name               = "${var.app_prefix}-image-lambda"
-  assume_role_policy = data.aws_iam_policy_document.image_lambda.json
+  assume_role_policy = data.aws_iam_policy_document.image_lambda_assume_role.json
+}
+
+data "aws_iam_policy_document" "image_lambda" {
+  statement {
+    effect    = "Allow"
+    actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = [aws_cloudwatch_log_group.image_lambda.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "image_lambda" {
+  role   = aws_iam_role.image_lambda.name
+  policy = data.aws_iam_policy_document.image_lambda.json
+}
+
+resource "aws_iam_role_policy_attachment" "name" {
+  role       = aws_iam_role.image_lambda.name
+  policy_arn = aws_iam_policy.image_bucket_read.arn
 }
