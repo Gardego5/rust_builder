@@ -12,6 +12,8 @@ resource "aws_lambda_function" "image_lambda" {
   source_code_hash = data.archive_file.image_lambda.output_base64sha256
   architectures    = ["arm64"]
   runtime          = "provided.al2"
+  timeout          = 30
+  memory_size      = 1024
   environment {
     variables = {
       "BUCKET_NAME" = resource.aws_s3_bucket.image_bucket.id
