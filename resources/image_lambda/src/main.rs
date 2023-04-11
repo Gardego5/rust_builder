@@ -1,34 +1,97 @@
-use lambda_http::{Body, Error, Request, Response};
+use axum::{
+    extract::State,
+    http::{header, StatusCode},
+    response::IntoResponse,
+    routing::get,
+    Json, Router,
+};
+use lambda_http::aws_lambda_events::serde_json::json;
 
-/// This is the main body for the function.
-/// Write your code inside it.
-/// There are some code example in the following URLs:
-/// - https://github.com/awslabs/aws-lambda-rust-runtime/tree/main/examples
-async fn function_handler(_event: Request) -> Result<Response<Body>, Error> {
-    // Extract some useful information from the request
+#[derive(serde::Serialize)]
+struct Error {
+    #[serde(rename = "type")]
+    _type: String,
+    message: String,
+}
 
-    // Return something that implements IntoResponse.
-    // It will be serialized to the right response event automatically by the runtime
-    let resp = Response::builder()
-        .status(200)
-        .header("content-type", "text/html")
-        .body("Hello AWS Lambda HTTP request".into())
-        .map_err(Box::new)?;
+type Response<T> = Result<T, (StatusCode, Json<Error>)>;
+fn error<T, Input: ToString>(
+    code: StatusCode,
+    message: impl ToString,
+) -> impl FnOnce(Input) -> Result<T, (StatusCode, Json<Error>)> {
+    move |e| {
+        Err((
+            code,
+            // [(header::CONTENT_TYPE, "application/problem+json")],
+            Json::from(Error {
+                _type: e.to_string(),
+                message: message.to_string(),
+            }),
+        ))
+    }
+}
 
-    Ok(resp)
+#[derive(Clone, Debug)]
+struct Environment {
+    bucket_name: String,
+}
+impl Environment {
+    fn load() -> Result<Self, lambda_http::Error> {
+        Ok(Self {
+            bucket_name: std::env::var("BUCKET_NAME")?,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct WarmContext {
+    s3_client: aws_sdk_s3::Client,
+    environment: Environment,
+}
+
+async fn root(
+    State(WarmContext {
+        s3_client,
+        environment,
+    }): State<WarmContext>,
+) -> Response<impl IntoResponse> {
+    let objects = s3_client
+        .list_objects_v2()
+        .bucket(environment.bucket_name)
+        .send()
+        .await
+        .or_else(error(StatusCode::INTERNAL_SERVER_ERROR, "Oops"))?
+        .contents()
+        .ok_or_else(|| "")
+        .or_else(error(StatusCode::BAD_REQUEST, "OOOS"))?
+        .to_owned();
+
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain")],
+        Json::from(
+            json!({ "objects": objects.iter().map(|o| format!("{o:?}")).collect::<Vec<String>>() }),
+        ),
+    ))
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Error> {
+async fn main() -> Result<(), lambda_http::Error> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
-        // disable printing the name of the module in every log line.
+        .with_ansi(false)
         .with_target(false)
-        // disabling time is handy because CloudWatch will add the ingestion time.
         .without_time()
         .init();
 
-    let handler = lambda_http::service_fn(function_handler);
+    let sdk_config = aws_config::from_env().load().await;
 
-    lambda_http::run(handler).await
+    let state = WarmContext {
+        s3_client: aws_sdk_s3::Client::new(&sdk_config),
+        environment: Environment::load()?,
+    };
+
+    let app = Router::new().route("/", get(root)).with_state(state);
+
+    lambda_http::run(app).await
 }
