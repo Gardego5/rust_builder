@@ -12,6 +12,12 @@ resource "aws_lambda_function" "image_lambda" {
   source_code_hash = data.archive_file.image_lambda.output_base64sha256
   architectures    = ["arm64"]
   runtime          = "provided.al2"
+  environment {
+    variables = {
+      "BUCKET_NAME" = resource.aws_s3_bucket.image_bucket.id
+      "REGION"      = var.region
+    }
+  }
 }
 
 resource "aws_lambda_function_url" "image_lambda" {
@@ -21,12 +27,12 @@ resource "aws_lambda_function_url" "image_lambda" {
 
 data "aws_iam_policy_document" "image_lambda" {
   statement {
-    effect = "Allow"
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
     principals {
       type        = "Service"
       identifiers = ["lambda.amazonaws.com"]
     }
-    actions = ["sts:AssumeRole"]
   }
 }
 
