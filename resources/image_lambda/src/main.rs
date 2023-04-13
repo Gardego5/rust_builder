@@ -1,3 +1,4 @@
+use accept_header::Accept;
 use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
@@ -5,6 +6,8 @@ use axum::{
     routing::get,
     Json, Router,
 };
+
+const AVAILABLE: &[mime::Mime] = &[mime::IMAGE_PNG, mime::IMAGE_JPEG];
 
 async fn root<'a>(
     headers: HeaderMap,
@@ -14,26 +17,34 @@ async fn root<'a>(
         s3_client,
         environment,
     }): State<WarmContext>,
-) -> Response<'a, impl IntoResponse> {
-    let content_type = match headers.get("accept") {
-        Some(t) => t.to_str().or_else(Error::op(
+) -> RR<impl IntoResponse> {
+    let accept_header: Accept = headers
+        .get("accept")
+        .unwrap_or(&axum::http::HeaderValue::from_static("*/*"))
+        .to_str()
+        .or_else(EJ::op(
             StatusCode::BAD_REQUEST,
-            "Couldn't read accept header.",
-        ))?,
-        None => "image/png",
-    };
+            "couldn't parse accept header [0]",
+        ))?
+        .parse()
+        .or_else(EJ::op(
+            StatusCode::BAD_REQUEST,
+            "couldn't parse accept header [1]",
+        ))?;
 
-    let format = match content_type.split_once("/").ok_or_else(Error::err(
-        StatusCode::BAD_REQUEST,
-        "invalid `accept` header.",
-    ))? {
-        ("image", "png") => Ok(image::ImageFormat::Png),
-        ("image", "webp") => Ok(image::ImageFormat::WebP),
-        ("image", "jpg" | "jpeg") => Ok(image::ImageFormat::Jpeg),
-        _ => Err(Error::err(
-            StatusCode::BAD_REQUEST,
-            format!("invalid `accept` header"),
-        )()),
+    let best = accept_header.negotiate(AVAILABLE).or_else(EJ::op(
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "Couldn't find a matching mime type.",
+    ))?;
+
+    let format = match (best.type_(), best.subtype()) {
+        (mime::IMAGE, mime::PNG) => Ok(image::ImageFormat::Png),
+        (mime::IMAGE, mime::JPEG) => Ok(image::ImageFormat::Jpeg),
+        _ => EJ::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Couldn't find a matching image format.",
+        )
+        .into(),
     }?;
 
     let (width, height) = match query.0 {
@@ -50,7 +61,7 @@ async fn root<'a>(
         .key(&path)
         .send()
         .await
-        .or_else(Error::op(
+        .or_else(EJ::op(
             StatusCode::NOT_FOUND,
             format!("Couldn't find image at {:?}", &path),
         ))?;
@@ -59,28 +70,28 @@ async fn root<'a>(
         .body
         .collect()
         .await
-        .or_else(Error::op(
+        .or_else(EJ::op(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Couldn't collect object body.",
         ))?
         .into_bytes();
 
     let image = image::load_from_memory(&in_buffer)
-        .or_else(Error::op(
+        .or_else(EJ::op(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Couldn't load image from memory.",
         ))?
         .resize_exact(width, height, image::imageops::Gaussian);
 
     let mut out_buffer = std::io::BufWriter::new(std::io::Cursor::new(Vec::new()));
-    image.write_to(&mut out_buffer, format).or_else(Error::op(
+    image.write_to(&mut out_buffer, format).or_else(EJ::op(
         StatusCode::INTERNAL_SERVER_ERROR,
         "Couldn't encode image. [0]",
     ))?;
 
-    let bytes = out_buffer
+    let image_bytes = out_buffer
         .into_inner()
-        .or_else(Error::op(
+        .or_else(EJ::op(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Couldn't encode image. [1]",
         ))?
@@ -88,8 +99,8 @@ async fn root<'a>(
 
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, content_type.to_string())],
-        bytes,
+        [(header::CONTENT_TYPE, best.to_string())],
+        image_bytes,
     ))
 }
 
@@ -100,64 +111,52 @@ struct Params {
 }
 
 #[derive(serde::Serialize)]
-struct Error {
+struct EJ {
+    #[serde(skip)]
+    code: StatusCode,
     #[serde(rename = "type")]
     error_type: Option<String>,
     message: String,
 }
+type ER = (StatusCode, [(axum::http::HeaderName, String); 1], Json<EJ>);
+type RR<T> = Result<T, ER>;
 
-type Response<'a, T> = Result<
-    T,
-    (
-        StatusCode,
-        [(axum::http::HeaderName, &'a str); 1],
-        Json<Error>,
-    ),
->;
-
-impl<'a> Error {
-    fn op<T, Input: ToString>(
-        code: StatusCode,
-        message: impl ToString,
-    ) -> impl FnOnce(
-        Input,
-    ) -> Result<
-        T,
+impl Into<ER> for EJ {
+    fn into(self) -> ER {
         (
-            StatusCode,
-            [(axum::http::HeaderName, &'a str); 1],
-            Json<Self>,
-        ),
-    > {
+            self.code,
+            [(
+                header::CONTENT_TYPE,
+                String::from("application/problem+json"),
+            )],
+            Json::from(self),
+        )
+    }
+}
+
+impl<T> Into<RR<T>> for EJ {
+    fn into(self) -> Result<T, ER> {
+        Err(self.into())
+    }
+}
+
+impl EJ {
+    fn op<T, I: ToString>(code: StatusCode, message: impl ToString) -> impl FnOnce(I) -> RR<T> {
         move |e| {
-            Err((
+            Self {
                 code,
-                [(header::CONTENT_TYPE, "application/error+json")],
-                Json::from(Self {
-                    error_type: Some(e.to_string()),
-                    message: message.to_string(),
-                }),
-            ))
+                error_type: Some(e.to_string()),
+                message: message.to_string(),
+            }
+            .into()
         }
     }
 
-    fn err(
-        code: StatusCode,
-        message: impl ToString,
-    ) -> impl FnOnce() -> (
-        StatusCode,
-        [(axum::http::HeaderName, &'a str); 1],
-        Json<Self>,
-    ) {
-        move || {
-            (
-                code,
-                [(header::CONTENT_TYPE, "application/error+json")],
-                Json::from(Self {
-                    error_type: None,
-                    message: message.to_string(),
-                }),
-            )
+    fn new(code: StatusCode, message: impl ToString) -> Self {
+        Self {
+            code,
+            error_type: None,
+            message: message.to_string(),
         }
     }
 }
