@@ -1,182 +1,21 @@
+use std::future::Future;
+
 use accept_header::Accept;
-use axum::{
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
-    response::IntoResponse,
-    routing::get,
-    Json, Router,
-};
+use errors::Error;
+use lambda_http::{http::StatusCode, Body, RequestExt, Response};
+use serde_json::json;
+use utils::{get_image, write_image_to_bytes};
 
-const AVAILABLE: &[mime::Mime] = &[mime::IMAGE_PNG, mime::IMAGE_JPEG];
+mod errors;
+mod utils;
 
-async fn root<'a>(
-    headers: HeaderMap,
-    query: Query<Params>,
-    Path((path,)): Path<(String,)>,
-    State(WarmContext {
-        s3_client,
-        environment,
-    }): State<WarmContext>,
-) -> RR<impl IntoResponse> {
-    let accept_header: Accept = headers
-        .get("accept")
-        .unwrap_or(&axum::http::HeaderValue::from_static("*/*"))
-        .to_str()
-        .or_else(EJ::op(
-            StatusCode::BAD_REQUEST,
-            "couldn't parse accept header [0]",
-        ))?
-        .parse()
-        .or_else(EJ::op(
-            StatusCode::BAD_REQUEST,
-            "couldn't parse accept header [1]",
-        ))?;
-
-    let best = accept_header.negotiate(AVAILABLE).or_else(EJ::op(
-        StatusCode::UNSUPPORTED_MEDIA_TYPE,
-        "Couldn't find a matching mime type.",
-    ))?;
-
-    let format = match (best.type_(), best.subtype()) {
-        (mime::IMAGE, mime::PNG) => Ok(image::ImageFormat::Png),
-        (mime::IMAGE, mime::JPEG) => Ok(image::ImageFormat::Jpeg),
-        _ => EJ::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "Couldn't find a matching image format.",
-        )
-        .into(),
-    }?;
-
-    let (width, height) = match query.0 {
-        Params {
-            width: Some(w),
-            height: Some(h),
-        } => (w, h),
-        _ => (100, 100),
-    };
-
-    let object = s3_client
-        .get_object()
-        .bucket(&environment.bucket_name)
-        .key(&path)
-        .send()
-        .await
-        .or_else(EJ::op(
-            StatusCode::NOT_FOUND,
-            format!("Couldn't find image at {:?}", &path),
-        ))?;
-
-    let in_buffer = object
-        .body
-        .collect()
-        .await
-        .or_else(EJ::op(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Couldn't collect object body.",
-        ))?
-        .into_bytes();
-
-    let image = image::load_from_memory(&in_buffer)
-        .or_else(EJ::op(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Couldn't load image from memory.",
-        ))?
-        .resize_exact(width, height, image::imageops::Gaussian);
-
-    let mut out_buffer = std::io::BufWriter::new(std::io::Cursor::new(Vec::new()));
-    image.write_to(&mut out_buffer, format).or_else(EJ::op(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Couldn't encode image. [0]",
-    ))?;
-
-    let image_bytes = out_buffer
-        .into_inner()
-        .or_else(EJ::op(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Couldn't encode image. [1]",
-        ))?
-        .into_inner();
-
-    Ok((
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, best.to_string())],
-        image_bytes,
-    ))
+pub struct Env {
+    pub bucket_name: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct Params {
-    width: Option<u32>,
-    height: Option<u32>,
-}
-
-#[derive(serde::Serialize)]
-struct EJ {
-    #[serde(skip)]
-    code: StatusCode,
-    #[serde(rename = "type")]
-    error_type: Option<String>,
-    message: String,
-}
-type ER = (StatusCode, [(axum::http::HeaderName, String); 1], Json<EJ>);
-type RR<T> = Result<T, ER>;
-
-impl Into<ER> for EJ {
-    fn into(self) -> ER {
-        (
-            self.code,
-            [(
-                header::CONTENT_TYPE,
-                String::from("application/problem+json"),
-            )],
-            Json::from(self),
-        )
-    }
-}
-
-impl<T> Into<RR<T>> for EJ {
-    fn into(self) -> Result<T, ER> {
-        Err(self.into())
-    }
-}
-
-impl EJ {
-    fn op<T, I: ToString>(code: StatusCode, message: impl ToString) -> impl FnOnce(I) -> RR<T> {
-        move |e| {
-            Self {
-                code,
-                error_type: Some(e.to_string()),
-                message: message.to_string(),
-            }
-            .into()
-        }
-    }
-
-    fn new(code: StatusCode, message: impl ToString) -> Self {
-        Self {
-            code,
-            error_type: None,
-            message: message.to_string(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct Environment {
-    bucket_name: String,
-}
-impl Environment {
-    fn load() -> Result<Self, lambda_http::Error> {
-        Ok(Self {
-            bucket_name: std::env::var("BUCKET_NAME")?,
-        })
-    }
-}
-
-#[derive(Clone)]
-struct WarmContext {
-    s3_client: aws_sdk_s3::Client,
-    environment: Environment,
+pub struct WarmContext {
+    pub s3_client: aws_sdk_s3::Client,
+    pub env: Env,
 }
 
 #[tokio::main]
@@ -188,14 +27,78 @@ async fn main() -> Result<(), lambda_http::Error> {
         .without_time()
         .init();
 
-    let sdk_config = aws_config::from_env().load().await;
-
-    let state = WarmContext {
-        s3_client: aws_sdk_s3::Client::new(&sdk_config),
-        environment: Environment::load()?,
+    let ctx: WarmContext = WarmContext {
+        s3_client: aws_sdk_s3::Client::new(&aws_config::from_env().load().await),
+        env: Env {
+            bucket_name: std::env::var("BUCKET_NAME")?,
+        },
     };
 
-    let app = Router::new().route("/*path", get(root)).with_state(state);
+    lambda_http::run(lambda_http::service_fn(|req| {
+        error_handler(req, &ctx, handler)
+    }))
+    .await
+}
 
-    lambda_http::run(app).await
+async fn error_handler<'a, F, Fut>(
+    req: lambda_http::Request,
+    ctx: &'a WarmContext,
+    handler: F,
+) -> Result<Response<Body>, lambda_http::Error>
+where
+    F: FnOnce(lambda_http::Request, &'a WarmContext) -> Fut,
+    Fut: Future<Output = Result<Response<Body>, Error>>,
+{
+    match handler(req, ctx).await {
+        Ok(result) => Ok(result),
+        Err(error) => Ok(error.try_into()?),
+    }
+}
+
+async fn handler(req: lambda_http::Request, ctx: &WarmContext) -> Result<Response<Body>, Error> {
+    let (width, height) = (
+        req.query_string_parameters()
+            .first("width")
+            .ok_or(error!(raw BAD_REQUEST, "you must provide a 'width' parameter"))?
+            .parse::<u32>()
+            .or_else(error!("'width' should be a number"))?,
+        req.query_string_parameters()
+            .first("height")
+            .ok_or(error!(raw BAD_REQUEST, "you must provide a 'height' parameter"))?
+            .parse::<u32>()
+            .or_else(error!("'height' should be a number"))?,
+    );
+
+    let content_type: mime::Mime = req
+        .headers()
+        .get("accept")
+        .unwrap_or(&lambda_http::http::HeaderValue::from_static("*/*"))
+        .to_str()
+        .or_else(error!())?
+        .parse::<Accept>()
+        .or_else(error!(BAD_REQUEST, "couldn't read accept header"))?
+        .negotiate(&[mime::IMAGE_PNG, mime::IMAGE_JPEG])
+        .or_else(error!(
+            UNSUPPORTED_MEDIA_TYPE,
+            "couldn't find suitable accept header"
+        ))?;
+
+    let format = match (content_type.type_(), content_type.subtype()) {
+        (mime::IMAGE, mime::PNG) => image::ImageFormat::Png,
+        (mime::IMAGE, mime::JPEG) => image::ImageFormat::Jpeg,
+        _ => return Err(Error(StatusCode::UNSUPPORTED_MEDIA_TYPE, json!({}))),
+    };
+
+    let path = req.uri().path();
+
+    let image = get_image(path, ctx)
+        .await?
+        .resize(width, height, image::imageops::Lanczos3);
+
+    let image_bytes = write_image_to_bytes(image, format)?;
+
+    Ok(Response::builder()
+        .header("Content-Type", content_type.to_string())
+        .body(Body::Binary(image_bytes))
+        .or_else(error!("could not build response"))?)
 }
