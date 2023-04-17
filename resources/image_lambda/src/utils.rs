@@ -1,4 +1,6 @@
 use crate::{error, errors::Error, WarmContext};
+use lambda_http::RequestExt;
+use std::str::FromStr;
 
 pub async fn get_image<'a>(
     path: &'a str,
@@ -11,7 +13,7 @@ pub async fn get_image<'a>(
         .key(path)
         .send()
         .await
-        .or_else(error!(NOT_FOUND))?
+        .or_else(error!(NOT_FOUND "could not retrieve object from s3"))?
         .body
         .collect()
         .await
@@ -32,4 +34,18 @@ pub fn write_image_to_bytes(
         .or_else(error!("could not convert image into bytes"))?;
 
     Ok(out_buffer.buffer().to_vec())
+}
+
+pub fn get_required_query_param<T: FromStr>(
+    req: &lambda_http::Request,
+    key: &str,
+) -> Result<T, Error>
+where
+    <T as FromStr>::Err: ToString,
+{
+    req.query_string_parameters()
+        .first(key)
+        .ok_or(error!(raw BAD_REQUEST format!("you must provide a {key} parameter")))?
+        .parse::<T>()
+        .or_else(error!(BAD_REQUEST format!("{key} could not be parsed as {}", std::any::type_name::<T>())))
 }
