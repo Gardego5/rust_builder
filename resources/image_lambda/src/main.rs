@@ -1,10 +1,8 @@
-use std::future::Future;
-
 use accept_header::Accept;
 use errors::Error;
-use lambda_http::{http::StatusCode, Body, RequestExt, Response};
+use lambda_http::{http::StatusCode, Body, Response};
 use serde_json::json;
-use utils::{get_image, write_image_to_bytes};
+use utils::{get_image, get_required_query_param, write_image_to_bytes};
 
 mod errors;
 mod utils;
@@ -35,38 +33,26 @@ async fn main() -> Result<(), lambda_http::Error> {
     };
 
     lambda_http::run(lambda_http::service_fn(|req| {
-        error_handler(req, &ctx, handler)
+        errors::handler(req, &ctx, handler)
     }))
     .await
 }
 
-async fn error_handler<'a, F, Fut>(
-    req: lambda_http::Request,
-    ctx: &'a WarmContext,
-    handler: F,
-) -> Result<Response<Body>, lambda_http::Error>
-where
-    F: FnOnce(lambda_http::Request, &'a WarmContext) -> Fut,
-    Fut: Future<Output = Result<Response<Body>, Error>>,
-{
-    match handler(req, ctx).await {
-        Ok(result) => Ok(result),
-        Err(error) => Ok(error.try_into()?),
-    }
-}
-
 async fn handler(req: lambda_http::Request, ctx: &WarmContext) -> Result<Response<Body>, Error> {
-    let (width, height) = (
-        req.query_string_parameters()
-            .first("width")
-            .ok_or(error!(raw BAD_REQUEST, "you must provide a 'width' parameter"))?
-            .parse::<u32>()
-            .or_else(error!("'width' should be a number"))?,
-        req.query_string_parameters()
-            .first("height")
-            .ok_or(error!(raw BAD_REQUEST, "you must provide a 'height' parameter"))?
-            .parse::<u32>()
-            .or_else(error!("'height' should be a number"))?,
+    let width: u32 = get_required_query_param(&req, "width")?;
+    let height: u32 = get_required_query_param(&req, "height")?;
+
+    println!(
+        "objects {:?}",
+        ctx.s3_client
+            .list_objects_v2()
+            .bucket(&ctx.env.bucket_name)
+            .send()
+            .await
+            .or_else(error!(INTERNAL_SERVER_ERROR "net error"))?
+            .contents()
+            .ok_or(error!(raw INTERNAL_SERVER_ERROR "nothing there"))?
+            .to_owned()
     );
 
     let content_type: mime::Mime = req
@@ -76,12 +62,9 @@ async fn handler(req: lambda_http::Request, ctx: &WarmContext) -> Result<Respons
         .to_str()
         .or_else(error!())?
         .parse::<Accept>()
-        .or_else(error!(BAD_REQUEST, "couldn't read accept header"))?
+        .or_else(error!(BAD_REQUEST "couldn't read accept header"))?
         .negotiate(&[mime::IMAGE_PNG, mime::IMAGE_JPEG])
-        .or_else(error!(
-            UNSUPPORTED_MEDIA_TYPE,
-            "couldn't find suitable accept header"
-        ))?;
+        .or_else(error!(UNSUPPORTED_MEDIA_TYPE "couldn't find suitable accept header"))?;
 
     let format = match (content_type.type_(), content_type.subtype()) {
         (mime::IMAGE, mime::PNG) => image::ImageFormat::Png,

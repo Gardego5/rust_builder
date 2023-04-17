@@ -1,5 +1,7 @@
+use crate::WarmContext;
 use lambda_http::{http::StatusCode, Body, Response};
 use serde_json::Value;
+use std::future::Future;
 
 pub struct Error(pub StatusCode, pub Value);
 impl TryInto<Response<Body>> for Error {
@@ -13,49 +15,45 @@ impl TryInto<Response<Body>> for Error {
     }
 }
 
+pub async fn handler<'a, F, Fut>(
+    req: lambda_http::Request,
+    ctx: &'a WarmContext,
+    handler: F,
+) -> Result<Response<Body>, lambda_http::Error>
+where
+    F: FnOnce(lambda_http::Request, &'a WarmContext) -> Fut,
+    Fut: Future<Output = Result<Response<Body>, Error>>,
+{
+    match handler(req, ctx).await {
+        Ok(result) => Ok(result),
+        Err(error) => Ok(error.try_into()?),
+    }
+}
+
 #[macro_export]
 macro_rules! error {
-    (raw $status:ident, $message:literal) => {
+    (json $status:ident $json:tt) => {
         crate::errors::Error(
             lambda_http::http::StatusCode::$status,
-            serde_json::json!({ "message": $message })
+            serde_json::json!($json),
         )
     };
-    (raw $message:literal) => {
-        error!(raw INTERNAL_SERVER_ERROR, $message)
+    (raw $status:ident $title:expr, $detail:expr) => {
+        error!(json $status { "title": $title, "detail": $detail })
     };
-    ($error_type:ty, $status:ident) => {
-        |error: $error_type| {
-            Err(crate::errors::Error(
-                lambda_http::http::StatusCode::$status,
-                serde_json::json!({ "error": error.to_string() }),
-            ))
-        }
-    };
-    ($error_type:ty, $status:ident, $message:literal) => {
-        |error: $error_type| {
-            Err(crate::errors::Error(
-                lambda_http::http::StatusCode::$status,
-                serde_json::json!({ "error": error.to_string(), "message": $message })
-            ))
-        }
-    };
-    () => {
-        error!(INTERNAL_SERVER_ERROR)
-    };
-    ($message:literal) => {
-        error!(INTERNAL_SERVER_ERROR, $message)
+    (raw $status:ident $title:expr) => {
+        error!(json $status { "title": $title })
     };
     ($status:ident) => {
-        error!(_, $status)
+        |error| Err(error!{raw $status error.to_string()})
     };
-    ($status:ident, $message:literal) => {
-        error!(_, $status, $message)
+    ($status:ident $message:expr) => {
+        |error| Err(error!{raw $status error.to_string(), $message})
     };
-    ($error_type:ty) => {
-        error!($error_type, INTERNAL_SERVER_ERROR)
+    ($message:expr) => {
+        |error| Err(error!{raw INTERNAL_SERVER_ERROR error.to_string(), $message})
     };
-    ($error_type:ty, $message:literal) => {
-        error!($error_type, INTERNAL_SERVER_ERROR, $message)
+    () => {
+        |error| Err(error!{raw INTERNAL_SERVER_ERROR error.to_string()})
     };
 }
