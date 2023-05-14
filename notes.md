@@ -14,8 +14,18 @@ So - some things I've found...
 cargo lambda new image_lambda_2;
 
 # Install some crates (dependencies).
-cargo add aws_config aws_sdk_s3 accept_header mime serde_json mime;
+
+# Web framework, makes it much more ergonomic to interact with http requests.
+cargo add axum;
+# Negotiate Accept header to send appropriate response.
+cargo add accept_header mime;
+# Serialize / Deserialize (read) Query params, headers, etc....
+# `derive` lets us just annotate a struct and it will then be automatically deserialized.
 cargo add serde --features derive;
+# Interact with AWS.
+cargo add aws_config aws_sdk_s3;
+# Resize images.
+cargo add image;
 ```
 
 Show Cargo.toml
@@ -57,60 +67,7 @@ Create struct to store the warmed up lambda context.
 
 ```rust
 struct WarmContext {
+  s3: aws_sdk_s3::Client,
   bucket_name: String, // Environment Variable
-  s3_client: aws_sdk_s3::Client,
 }
 ```
-
-Parse Environment Variables
-Create S3 Client
-
-Change our `function_handler` to accept a ctx
-**don't use reference**
-
-```rust
-async fn function_handler(event: Request, ctx: WarmContext) ->
-  Result<Response<Body>, Error> {}
-```
-
-```rust initialize context
-let config = aws_config::from_env().load().await; // Await lets there be a break point for tokio
-
-let ctx = WarmContext {
-  s3_client: aws_sdk_s3::Client::new(&config),
-  bucket_name: std::env::var("BUCKET_NAME")?, // try... if it fails, early return.
-}
-```
-
-function returns result, nothing or Error.
-Special "boxed" error, accepts most errors.
-If something goes wrong, it will log to cloudfront.
-
-```rust update function_handler call
-run(service_fn(|req| function_handler(req, ctx))).await
-```
-
-Updated.
-LSP Error because:
-
-> main.rs(43, 5): the requirement to implement `FnMut` derives from here \
-> main.rs(43, 48): closure is `FnOnce` because it moves the variable `ctx` out of its environment
-
-`FnOnce` consumes `ctx`, we don't need to use it up, we just need to observe it.
-We just need a _reference!_
-
-### function handler
-
-What it will do:
-
-1. 2 Required query params \
-   both need to be a number.
-
-   - `width`
-   - `height`
-
-2. Load the image from s3.
-
-3. Resize it (as specified from the query params)
-
-4. Respond with the generated image.
