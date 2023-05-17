@@ -12,16 +12,12 @@ struct WarmContext {
     bucket_name: String,
 }
 
+type Error = (StatusCode, String);
+
 #[derive(serde::Deserialize)]
 struct Params {
     width: u32,
     height: u32,
-}
-
-macro_rules! error {
-    ($status:ident) => {
-        |e| Err((StatusCode::$status, e.to_string()))
-    };
 }
 
 async fn handler(
@@ -29,16 +25,18 @@ async fn handler(
     Query(Params { width, height }): Query<Params>,
     Path(path): Path<String>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, Error> {
     let accept = match headers.get("accept") {
-        Some(accept) => accept.to_str().or_else(error!(INTERNAL_SERVER_ERROR))?,
+        Some(accept) => accept
+            .to_str()
+            .map_err(error(StatusCode::INTERNAL_SERVER_ERROR))?,
         None => "*/*",
     };
     let negotiated = accept
         .parse::<accept_header::Accept>()
-        .or_else(error!(BAD_REQUEST))?
+        .map_err(error(StatusCode::BAD_REQUEST))?
         .negotiate(&AVAILABLE_FORMATS)
-        .or_else(|e| Err((e, format!("available types: {AVAILABLE_FORMATS:?}"))))?;
+        .map_err(|e| (e, format!("available types: {AVAILABLE_FORMATS:?}")))?;
     let format = match (negotiated.type_(), negotiated.subtype()) {
         (mime::IMAGE, mime::PNG) => image::ImageFormat::Png,
         (mime::IMAGE, mime::JPEG) => image::ImageFormat::Jpeg,
@@ -51,28 +49,28 @@ async fn handler(
         .key(&path)
         .send()
         .await
-        .or_else(error!(NOT_FOUND))?
+        .map_err(error(StatusCode::NOT_FOUND))?
         .body
         .collect()
         .await
-        .or_else(error!(INTERNAL_SERVER_ERROR))?
+        .map_err(error(StatusCode::INTERNAL_SERVER_ERROR))?
         .into_bytes();
 
     let image = image::load_from_memory(&in_buffer)
-        .or_else(error!(INTERNAL_SERVER_ERROR))?
+        .map_err(error(StatusCode::INTERNAL_SERVER_ERROR))?
         .resize_to_fill(width, height, image::imageops::Nearest);
 
     let mut out_buffer = std::io::BufWriter::new(std::io::Cursor::new(vec![]));
     image
         .write_to(&mut out_buffer, format)
-        .or_else(error!(INTERNAL_SERVER_ERROR))?;
+        .map_err(error(StatusCode::INTERNAL_SERVER_ERROR))?;
 
     Ok((
         StatusCode::OK,
         [(CONTENT_TYPE, negotiated.to_string())],
         out_buffer
             .into_inner()
-            .or_else(error!(INTERNAL_SERVER_ERROR))?
+            .map_err(error(StatusCode::INTERNAL_SERVER_ERROR))?
             .into_inner(),
     ))
 }
@@ -97,4 +95,8 @@ async fn main() -> Result<(), lambda_http::Error> {
         .with_state(warm_context);
 
     lambda_http::run(app).await
+}
+
+fn error<E: ToString>(status: StatusCode) -> impl FnOnce(E) -> Error {
+    move |e| (status, e.to_string())
 }
